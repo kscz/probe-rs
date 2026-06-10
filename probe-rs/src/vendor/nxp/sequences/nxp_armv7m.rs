@@ -11,12 +11,13 @@ use std::{
 
 use crate::{
     architecture::arm::{
-        ArmError,
+        ArmDebugInterface, ArmError, FullyQualifiedApAddress,
         armv7m::{Demcr, FpCtrl, FpRev2CompX},
         core::{
             armv7m::{Aircr, Dhcsr},
             registers::cortex_m::PC,
         },
+        dp::DpAddress,
         memory::ArmMemoryInterface,
         sequences::{self, ArmDebugSequence, ArmDebugSequenceError},
     },
@@ -604,5 +605,353 @@ impl DebugCache {
         }
 
         Ok(())
+    }
+}
+
+
+/// Debug sequences for NXP S32K3xx MCUs.
+///
+/// S32K3 parts expose a "Self-hosted Debug Access Port" (SDA-AP) that gates
+/// debug visibility. On power-up the SDA-AP keeps debug disabled until we
+/// write to its `DBGENCTRL` register — pyOCD does this as part of its
+/// connect sequence:
+///
+/// ```python
+/// self.dp.aps[SDA_AP_ID].write_reg(SDA_AP_DBGENCTRL_ADDR, SDA_AP_EN_ALL)
+/// ```
+///
+/// We do the same in [`debug_device_unlock`], which the default
+/// [`ArmDebugSequence`] dispatch runs after `debug_port_start` has powered
+/// the DP up.
+#[derive(Debug)]
+pub struct S32K3xx {
+    /// Matches the MIMXRT10xx pattern: we may be catching the core at a
+    /// watchpoint placed by the reset sequence. "Not catching" means we
+    /// release it after the watchpoint hits.
+    simulate_reset_catch: AtomicBool,
+}
+
+impl S32K3xx {
+    // AP IDs:
+    // [1]   APB_AP
+    // [4]   CM7_0_AHB_AP
+    // [6]   MDM_AP
+    // [7]   SDA_AP
+    const _APD_AP_INDEX: u8 = 1;
+    const _CM7_0_AHB_AP_INDEX: u8 = 4;
+    const MDM_AP_INDEX: u8 = 6;
+    const SDA_AP_INDEX: u8 = 7;
+
+    /// Offset of the `MDMAPCTL` register inside the MDM-AP.
+    const MDM_AP_CTL_ADDR: u64 = 0x04;
+
+    // MDMAPCTL value sequence for `FunctionalReset`:
+    //   step 1: assert RSTRELCM7/RSTRELTLn + CMnDBGREQ
+    //   step 2: above + SYSFUNCRST  (this is the actual reset trigger)
+    //   step 3: drop SYSFUNCRST, keep RSTRELCM7/RSTRELTLn + CMnDBGREQ
+    //   step 4: drop CMnDBGREQ so the core leaves debug mode and runs
+    const MDMAPCTL_RSTRELCM7_DBGREQ: u32 = 0x0040_0B00;
+    const MDMAPCTL_RSTRELCM7_DBGREQ_SYSFUNCRST: u32 = 0x0040_0B20;
+    const MDMAPCTL_RSTRELCM7: u32 = 0x0040_0000;
+
+    /// Offset of the `DBGENCTRL` register inside the SDA-AP.
+    const SDA_AP_DBGENCTRL_ADDR: u64 = 0x80;
+
+
+    // SDA_AP DBGENCTRL bit fields:
+    // [31:30]   reserved
+    // [29]      Core Non-Invasive Debug Enable (CNIDEN)
+    // [28]      Core Debug Enable (CDBGEN)
+    // [27:8]    reserved
+    // [7]       Global Secure Privileged Non-Invasive Debug Enable (GSPNIDEN)
+    // [6]       Global Secure Privileged Debug Enable (GSPIDEN)
+    // [5]       Global Non-Invasive Debug Enable (GNIDEN)
+    // [4]       Global Debug Enable (GDBGEN)
+    // [3:0]     reserved
+    const SDA_AP_CNIDEN: u32 = 1 << 29;
+    const SDA_AP_CDBGEN: u32 = 1 << 28;
+    const SDA_AP_GSPNIDEN: u32 = 1 << 7;
+    const SDA_AP_GSPIDEN: u32 = 1 << 6;
+    const SDA_AP_GNIDEN: u32 = 1 << 5;
+    const SDA_AP_GDBGEN: u32 = 1 << 4;
+
+    /// Value written to `DBGENCTRL` to enable all debug functions.
+    const SDA_AP_EN_ALL: u32 = Self::SDA_AP_CNIDEN
+        | Self::SDA_AP_CDBGEN
+        | Self::SDA_AP_GSPNIDEN
+        | Self::SDA_AP_GSPIDEN
+        | Self::SDA_AP_GNIDEN
+        | Self::SDA_AP_GDBGEN;
+
+    /// Create a sequence handle for the S32K3xx.
+    pub fn create() -> Arc<dyn ArmDebugSequence> {
+        Arc::new(Self {
+            simulate_reset_catch: AtomicBool::new(false),
+        })
+    }
+
+    // ---- MC_ME (Mode Entry) — used to enable peripheral clocks ----
+    // Reference: Keil S32K3xx_DFP pdsc, sequence `EnablePeripheralClocks` (S32K344).
+    const MC_ME_CTL_KEY: u64 = 0x402D_C000;
+    const MC_ME_KEY: u32 = 0x0000_5AF0;
+    const MC_ME_INVKEY: u32 = 0x0000_A50F;
+
+    const MC_ME_PRTN0_PCONF: u64 = 0x402D_C100;
+    const MC_ME_PRTN0_PUPD: u64 = 0x402D_C104;
+    const MC_ME_PRTN0_COFB1_CLKEN: u64 = 0x402D_C134;
+
+    const MC_ME_PRTN1_PCONF: u64 = 0x402D_C300;
+    const MC_ME_PRTN1_PUPD: u64 = 0x402D_C304;
+    const MC_ME_PRTN1_COFB0_CLKEN: u64 = 0x402D_C330;
+    const MC_ME_PRTN1_COFB1_CLKEN: u64 = 0x402D_C334;
+    const MC_ME_PRTN1_COFB2_CLKEN: u64 = 0x402D_C338;
+    const MC_ME_PRTN1_COFB3_CLKEN: u64 = 0x402D_C33C;
+
+    const MC_ME_PRTN2_PCONF: u64 = 0x402D_C500;
+    const MC_ME_PRTN2_PUPD: u64 = 0x402D_C504;
+    const MC_ME_PRTN2_COFB0_CLKEN: u64 = 0x402D_C530;
+    const MC_ME_PRTN2_COFB1_CLKEN: u64 = 0x402D_C534;
+
+    // ---- eDMA / DMAMUX — used to bulk-init ECC RAM ----
+    // The pdsc programs DMA channel 0 via DMAMUX_0 and TCD0.
+    const DMAMUX0_CHCFG0: u64 = 0x4028_0003;
+    const TCD0_BASE: u64 = 0x4021_0000;
+    const TCD0_CH_CSR: u64 = Self::TCD0_BASE + 0x000;
+    const TCD0_SADDR: u64 = Self::TCD0_BASE + 0x020;
+    const TCD0_ATTR: u64 = Self::TCD0_BASE + 0x024;
+    const TCD0_NBYTES: u64 = Self::TCD0_BASE + 0x028;
+    const TCD0_SLAST_SDA: u64 = Self::TCD0_BASE + 0x02C;
+    const TCD0_DADDR: u64 = Self::TCD0_BASE + 0x030;
+    const TCD0_DOFF_CITER: u64 = Self::TCD0_BASE + 0x034;
+    const TCD0_DLAST_SGA: u64 = Self::TCD0_BASE + 0x038;
+    const TCD0_CSR: u64 = Self::TCD0_BASE + 0x03C;
+
+    /// Bit in TCD_CH_CSR signalling the channel is still transferring.
+    const TCD_ACTIVE: u32 = 0x8000_0000;
+
+    fn enable_sda_debug(
+        &self,
+        interface: &mut dyn ArmDebugInterface,
+        dp: DpAddress,
+    ) -> Result<(), ArmError> {
+        let sda_ap = FullyQualifiedApAddress::v1_with_dp(dp, Self::SDA_AP_INDEX);
+        tracing::debug!(
+            "S32K3xx: enabling debug via SDA-AP (ap={}, DBGENCTRL={:#x} <- {:#010x})",
+            Self::SDA_AP_INDEX,
+            Self::SDA_AP_DBGENCTRL_ADDR,
+            Self::SDA_AP_EN_ALL,
+        );
+        interface.write_raw_ap_register(&sda_ap, Self::SDA_AP_DBGENCTRL_ADDR, Self::SDA_AP_EN_ALL)?;
+        interface.flush()?;
+        Ok(())
+    }
+
+    /// Commit a pending MC_ME partition update
+    fn mc_me_commit(memory: &mut dyn ArmMemoryInterface) -> Result<(), ArmError> {
+        memory.write_word_32(Self::MC_ME_CTL_KEY, Self::MC_ME_KEY)?;
+        memory.write_word_32(Self::MC_ME_CTL_KEY, Self::MC_ME_INVKEY)?;
+        Ok(())
+    }
+
+    fn enable_peripheral_clocks(memory: &mut dyn ArmMemoryInterface) -> Result<(), ArmError> {
+        tracing::debug!("S32K3xx: enabling peripheral clocks (S32K344 partitions 0/1/2)");
+
+        // Partition 0
+        memory.write_word_32(Self::MC_ME_PRTN0_COFB1_CLKEN, 0x0000_F7DF)?;
+        memory.write_word_32(Self::MC_ME_PRTN0_PCONF, 0x0000_0001)?;
+        memory.write_word_32(Self::MC_ME_PRTN0_PUPD, 0x0000_0001)?;
+        Self::mc_me_commit(memory)?;
+
+        // Partition 1
+        memory.write_word_32(Self::MC_ME_PRTN1_COFB0_CLKEN, 0xB1E0_FFF8)?;
+        memory.write_word_32(Self::MC_ME_PRTN1_COFB1_CLKEN, 0x812A_A407)?;
+        memory.write_word_32(Self::MC_ME_PRTN1_COFB2_CLKEN, 0xBBF3_FE7E)?;
+        memory.write_word_32(Self::MC_ME_PRTN1_COFB3_CLKEN, 0x0000_0141)?;
+        memory.write_word_32(Self::MC_ME_PRTN1_PCONF, 0x0000_0001)?;
+        memory.write_word_32(Self::MC_ME_PRTN1_PUPD, 0x0000_0001)?;
+        Self::mc_me_commit(memory)?;
+
+        // Partition 2
+        memory.write_word_32(Self::MC_ME_PRTN2_COFB0_CLKEN, 0x29FF_FFF0)?;
+        memory.write_word_32(Self::MC_ME_PRTN2_COFB1_CLKEN, 0xC489_87F9)?;
+        memory.write_word_32(Self::MC_ME_PRTN2_PCONF, 0x0000_0001)?;
+        memory.write_word_32(Self::MC_ME_PRTN2_PUPD, 0x0000_0001)?;
+        Self::mc_me_commit(memory)?;
+
+        memory.flush()?;
+        Ok(())
+    }
+
+    /// Program DMA channel 0 (TCD0) for a 64-bit-wide copy of `nbytes` from
+    /// `src` to `dst`, then start the transfer and wait for completion.
+    ///
+    /// The TCD field encodings come straight from the pdsc `RAMInitialize`:
+    /// `ATTR = 0x03030000` (SSIZE/DSIZE = 64-bit), `DOFF_CITER = 0x00010008`
+    /// (8-byte destination stride, one major iteration), single major loop.
+    fn dma_copy(
+        memory: &mut dyn ArmMemoryInterface,
+        src: u32,
+        dst: u32,
+        nbytes: u32,
+    ) -> Result<(), ArmError> {
+        // Re-arm the DMAMUX channel so the trigger comes from the explicit
+        // start in TCD0_CSR rather than a peripheral request.
+        memory.write_word_8(Self::DMAMUX0_CHCFG0, 0x80)?;
+        memory.write_word_32(Self::TCD0_SADDR, src)?;
+        memory.write_word_32(Self::TCD0_ATTR, 0x0303_0000)?;
+        memory.write_word_32(Self::TCD0_NBYTES, nbytes)?;
+        memory.write_word_32(Self::TCD0_SLAST_SDA, 0)?;
+        memory.write_word_32(Self::TCD0_DADDR, dst)?;
+        memory.write_word_32(Self::TCD0_DOFF_CITER, 0x0001_0008)?;
+        // Last-destination-address adjustment is -nbytes so the channel
+        // rewinds for the next reuse.
+        memory.write_word_32(Self::TCD0_DLAST_SGA, nbytes.wrapping_neg())?;
+        memory.write_word_32(Self::TCD0_CSR, 0x0000_0001)?;
+        memory.flush()?;
+
+        let start = Instant::now();
+        loop {
+            let csr = memory.read_word_32(Self::TCD0_CH_CSR)?;
+            if csr & Self::TCD_ACTIVE == 0 {
+                return Ok(());
+            }
+            if start.elapsed() > Duration::from_secs(1) {
+                tracing::warn!("S32K3xx: DMA RAM-init timeout, CH_CSR={csr:#010x}");
+                return Err(ArmError::Timeout);
+            }
+        }
+    }
+
+    /// Initialize SRAM and DTCM ECC via DMA.
+    fn ram_initialize(memory: &mut dyn ArmMemoryInterface) -> Result<(), ArmError> {
+        tracing::debug!("S32K3xx: RAMInitialize (S32K344: 320 KiB SRAM + 128 KiB DTCM)");
+
+        // SRAM: 2 x 160 KiB @ 0x20400000
+        Self::dma_copy(memory, 0x0040_0000, 0x2040_0000, 0x0005_0000)?;
+
+        // DTCM: 1 x 128 KiB @ 0x20000000, accessed via the 0x21000000 backdoor.
+        Self::dma_copy(memory, 0x0040_0000, 0x2100_0000, 0x0002_0000)?;
+
+        Ok(())
+    }
+
+    /// Reset the chip via the MDM-AP
+    fn functional_reset(
+        probe: &mut dyn ArmMemoryInterface,
+        release_core: bool,
+    ) -> Result<(), ArmError> {
+        let dp = probe.fully_qualified_address().dp();
+        let interface = probe.get_arm_debug_interface()?;
+        let mdm_ap = FullyQualifiedApAddress::v1_with_dp(dp, Self::MDM_AP_INDEX);
+
+        tracing::debug!(
+            "S32K3xx: FunctionalReset via MDM-AP (release_core={release_core})",
+        );
+
+        interface.write_raw_ap_register(&mdm_ap, Self::MDM_AP_CTL_ADDR, Self::MDMAPCTL_RSTRELCM7_DBGREQ)?;
+        interface.write_raw_ap_register(
+            &mdm_ap,
+            Self::MDM_AP_CTL_ADDR,
+            Self::MDMAPCTL_RSTRELCM7_DBGREQ_SYSFUNCRST,
+        )?;
+        interface.write_raw_ap_register(&mdm_ap, Self::MDM_AP_CTL_ADDR, Self::MDMAPCTL_RSTRELCM7_DBGREQ)?;
+        if release_core {
+            interface.write_raw_ap_register(&mdm_ap, Self::MDM_AP_CTL_ADDR, Self::MDMAPCTL_RSTRELCM7)?;
+        }
+        interface.flush()?;
+        Ok(())
+    }
+
+    /// Halt or unhalt the core. Mirrors the MIMXRT10xx helper.
+    fn halt(&self, probe: &mut dyn ArmMemoryInterface, halt: bool) -> Result<(), ArmError> {
+        let mut dhcsr = Dhcsr(probe.read_word_32(Dhcsr::get_mmio_address())?);
+        dhcsr.set_c_halt(halt);
+        dhcsr.set_c_debugen(true);
+        dhcsr.enable_write();
+
+        probe.write_word_32(Dhcsr::get_mmio_address(), dhcsr.into())?;
+        probe.flush()?;
+
+        let start = Instant::now();
+        let action = if halt { "halt" } else { "unhalt" };
+        while Dhcsr(probe.read_word_32(Dhcsr::get_mmio_address())?).s_halt() != halt {
+            if start.elapsed() > Duration::from_millis(100) {
+                tracing::debug!("Exceeded timeout while waiting for core to {action}");
+                return Err(ArmError::Timeout);
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        Ok(())
+    }
+}
+
+impl ArmDebugSequence for S32K3xx {
+    // Called after `debug_port_start` succeeds
+    fn debug_device_unlock(
+        &self,
+        interface: &mut dyn ArmDebugInterface,
+        default_ap: &FullyQualifiedApAddress,
+        _permissions: &crate::Permissions,
+    ) -> Result<(), ArmError> {
+        //   1. EnableM7Debug          — write SDA-AP DBGENCTRL
+        //   2. EnablePeripheralClocks — turn on the MC_ME partitions that
+        //                               gate eDMA/DMAMUX
+        //   3. RAMInitialize          — use DMA to initialize ECC across SRAM and DTCM
+        self.enable_sda_debug(interface, default_ap.dp())?;
+
+        let mut memory = interface.memory_interface(default_ap)?;
+        Self::enable_peripheral_clocks(&mut *memory)?;
+        Self::ram_initialize(&mut *memory)?;
+        Ok(())
+    }
+
+    fn reset_catch_set(
+        &self,
+        _: &mut dyn ArmMemoryInterface,
+        _: probe_rs_target::CoreType,
+        _: Option<u64>,
+    ) -> Result<(), ArmError> {
+        self.simulate_reset_catch.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn reset_catch_clear(
+        &self,
+        _: &mut dyn ArmMemoryInterface,
+        _: probe_rs_target::CoreType,
+        _: Option<u64>,
+    ) -> Result<(), ArmError> {
+        self.simulate_reset_catch.store(false, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn reset_system(
+        &self,
+        interface: &mut dyn ArmMemoryInterface,
+        _core_type: crate::CoreType,
+        _debug_base: Option<u64>,
+    ) -> Result<(), ArmError> {
+        self.halt(interface, true)?;
+        sequences::cortex_m_reset_system(interface)?;
+        self.halt(interface, true)?;
+
+        Ok(())
+    }
+
+    fn debug_core_stop(
+        &self,
+        interface: &mut dyn ArmMemoryInterface,
+        _core_type: crate::CoreType,
+    ) -> Result<(), ArmError> {
+        // The default `debug_core_stop` just clears DHCSR, which on S32K3
+        // would resume the core from wherever the flash algorithm left it
+        // (PC somewhere in the SRAM scratch area). The core then executes
+        // garbage, takes a fault, and the FCCU loops the chip on reset.
+        //
+        // Instead, do a real reset on the way out: `FunctionalReset` with
+        // `release_core=true` resets through MDM-AP and ends by dropping
+        // CMnDBGREQ, so the CM7 comes out of reset and runs the freshly-
+        // flashed application from its reset vector.
+        Self::functional_reset(interface, true)
     }
 }
